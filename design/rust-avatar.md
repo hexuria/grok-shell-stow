@@ -1,0 +1,110 @@
+# Rust-Native Avatar Plan
+
+Move the Grok mark's per-frame silhouette solve from pre-baked atlas data to a
+native Rust solver exposed as an nsh app crate. Engine, state machine, gaze and
+paint stay in TS/TSX — only the hot path moves.
+
+## Why
+
+Current state (verified):
+
+- `app/mark/motion.mjs`'s solver — `IM(body, pose)` → `bh(Cs(e), pose)` →
+  union via `EM → GS/YS/WS/US/KS/QS/ZS` — costs ~10–40 ms/frame in QuickJS,
+  multi-second on bad poses (square family). That is why `atlas.data.ts`
+  (~900 KB) and `rest.data.ts` exist: every pose is pre-solved offline and the
+  runtime only lerps between baked outlines.
+- Consequences: ~900 KB of generated data in the bundle, residual spikes when
+  interpolation is too coarse, approximation error vs Grok's real solver, and
+  the avatar can never leave the pre-sampled pose grid.
+
+The nsh fork already has the mechanism (`crates/nsh-cli/src/rust_app.rs`,
+`crates/nsh-js/src/modules.rs`, `nsh-macros`' `#[native_module]`,
+`examples/gallery-rs/native`):
+
+```jsonc
+// app/nsh.json
+{ "rust": "../rust/mark" }
+```
+
+names a Cargo crate whose `#[native_module("grok-shell/mark")]` entry point
+registers functions that become ES-module exports. nsh builds an app-owned
+host — a workspace in `.nsh/rust` linking our crate into the dev host and the
+release runner — so `import { outline } from "grok-shell/mark"` in TSX calls
+native code per frame.
+
+## Architecture
+
+```
+JS/TSX (unchanged)                    Rust (new)
+─────────────────────────             ────────────────────────────────
+motion.mjs engine                     rust/mark crate
+  clips, gaze, morphs,    ──calls──▶   outline(body, yaw, pitch, roll)
+  state director, pokes                = Cs solids + bh transforms
+markpaint.ts / canvas      ◀──polys──    + EM→…→ZS polygon union
+blob.tsx placement
+```
+
+- Engine stays JS — it is logic, not math; only the solver is hot.
+- `markatlas.mjs` becomes the fallback when the module is absent (web target,
+  prebuilt host without the crate). Fallback stays permanently — the web
+  runtime has no Rust.
+- Solid vertex tables (`Cs`/`oc`/`Rb` for the 25 shapes) are dumped from JS to
+  `rust/mark/src/solids.json` once and `include_str!`'d — the crate is
+  self-contained, no runtime dependency on the JS data.
+
+## What gets ported (~150 lines)
+
+From `app/mark/motion.mjs`:
+
+- Quat/matrix helpers: `ca`, `_o`, `Pb`, `Ab`, `cr`, `Ib`, `Jf`, `Et`, `rs`
+- Transform: `bh` (solid polys → posed space), `Cs` (solid lookup)
+- Union: `EM → GS/YS/WS/US/KS/QS/ZS` — segment arrangement with winding
+  counts over a spatial grid (`Rs`), then outline extraction
+- Entry: `IM`'s memo/LRU (`Wn`/`MM`) — keep memoization in Rust, same key
+
+Validation is free: `atlas.data.ts` is ground truth. The Rust solver must
+match `IM()` output at identical poses within float epsilon — checked as a
+Rust unit test plus an offline JS↔Rust comparison harness.
+
+## Steps
+
+1. Dump solid tables from `motion.mjs` → `rust/mark/src/solids.json` (node script).
+2. Scaffold `rust/mark`: `Cargo.toml` + `#[native_module("grok-shell/mark")]`
+   exporting `outline(body: string, yaw: f64, pitch: f64, roll: f64)`.
+3. Port helpers + solver; Rust unit tests against dumped expected outputs.
+4. `app/nsh.json` gets `"rust": "../rust/mark"`; verify `nsh dev` builds the
+   app workspace in `.nsh/rust` (first build is minutes, then incremental).
+5. `blob.tsx`/`markatlas.mjs`: try the native module, fall back to atlas.
+   Keep the atlas import lazy so the data only loads when needed.
+6. Validation harness: pose-grid diff of Rust vs JS outputs (epsilon ~1e-9,
+   or rasterize both and diff pixels); frame-cost benchmark vs atlas lookup.
+7. Housekeeping: `.nsh/rust/` + `rust/target/` gitignored; README/justfile
+   notes (cargo becomes a build dependency on every dev machine).
+
+## Trade-offs
+
+- Win: exact solver at native speed — kills residual spikes and the pose
+  grid; drops ~900 KB baked data from the bundle; clean path to mobile.
+- Cost: `nsh run`/`dev`/`build`/`package` now compile Rust — cargo is a
+  hard build dependency; first workspace build is slow.
+- The avatar is not 100% Rust — engine/director/gaze/paint stay JS. Porting
+  all 633 engine lines + the state machine is a separate, much bigger project
+  and unnecessary: only the solver is hot.
+
+## Risks
+
+- Union port correctness → mitigated by atlas ground truth + a diff harness
+  before swapping the live path.
+- JS↔Rust marshalling per frame — measure; if it shows, batch all pose solves
+  for a frame into one call returning multiple outlines.
+- `.nsh/rust` workspace builds need network access for crates.io the first
+  time unless nsh's path deps cover everything (rust_app.rs says crates.io at
+  this nsh's version, patched to the checkout — verify in practice).
+
+## Open questions
+
+- Return shape: polygon list (`number[][][]`) vs flat `Float64Array` —
+  whatever markpaint's `path`/`shape` consumes with least copying.
+- Whether `rest.data.ts` can also be generated by Rust at init instead of
+  shipped (probably — same solver at pose 0); keep it baked initially.
+- Ambient morph tables: same question; decide after the solver lands.
